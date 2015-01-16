@@ -6,6 +6,119 @@
 
 #include "plugin.h"
 
+static void
+buffer_blit_row(unsigned char* dst, int dst_ncmpt,
+		unsigned char* src, int src_ncmpt,
+		int width)
+{
+  for (; width; width--) {
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = src[2];
+    dst += dst_ncmpt;
+    src += src_ncmpt;
+  }
+}
+
+static void
+buffer_blit(unsigned char* dst, int dst_ncmpt, int dst_stride,
+	    unsigned char* src, int src_ncmpt, int src_stride,
+	    int width, int height)
+{
+  for (unsigned int y = 0; y < height; y++) {
+    buffer_blit_row(dst, dst_ncmpt, src, src_ncmpt, width);
+    dst += dst_stride;
+    src += src_stride;
+  }
+}
+
+enum {SUBPIXEL_HRGB, SUBPIXEL_HBGR, SUBPIXEL_VRGB, SUBPIXEL_VBGR};
+
+/* 5-tap filter from Freetype, see ftlcdfil.h.  */
+static inline int
+filter(int x0, int x1, int x2, int x3, int x4)
+{
+  int FIR_WA = 0x30, FIR_WC = 0x20;
+  int w0 = FIR_WA - FIR_WC, w1 = FIR_WA + FIR_WC, w2 = FIR_WA * 2;
+  int W = w0 + w1 + w2 + w1 + w0;
+
+  return (x0 * w0 + x1 * w1 + x2 * w2 + x3 * w1 + x4 * w0 + W / 2) / W;
+}
+
+/* Shrink a bitmap by 3x horizontally with subpixel precision.  For pixel
+   data, BGR layout is assumed.  SUBPIX_ORDER is physical layout.  */
+static void
+buffer_subpix_x(unsigned char* dst, int dst_ncmpt, int dst_stride,
+		unsigned char* src, int src_ncmpt, int src_stride,
+		int width, int height, int subpix_order)
+{
+  int n = src_ncmpt;
+  int blue_offset = (subpix_order == SUBPIXEL_HBGR) ? -n : n;
+  src += n;
+
+  for (unsigned int y = 0; y < height; y++) {
+    unsigned char* d = dst;
+    unsigned char* s = src;
+    /* Do not bother filtering the first and the last columns.  */
+    {
+      d[0] = s[0];
+      d[1] = s[1];
+      d[2] = s[2];
+      s += src_ncmpt * 3;
+      d += dst_ncmpt;
+    }
+    for (unsigned int x = 1; x < width - 1; x++) {
+      s += blue_offset;
+      d[0] = filter(s[-n * 2], s[-n], s[0], s[n], s[n * 2]);
+      s += -blue_offset + 1;
+      d[1] = filter(s[-n * 2], s[-n], s[0], s[n], s[n * 2]);
+      s += -blue_offset + 1;
+      d[2] = filter(s[-n * 2], s[-n], s[0], s[n], s[n * 2]);
+      s += blue_offset - 2 + src_ncmpt * 3;
+      d += dst_ncmpt;
+    }
+    {
+      d[0] = s[0];
+      d[1] = s[1];
+      d[2] = s[2];
+    }
+    dst += dst_stride;
+    src += src_stride;
+  }
+}
+
+static void
+buffer_subpix_y(unsigned char* dst, int dst_ncmpt, int dst_stride,
+		unsigned char* src, int src_ncmpt, int src_stride,
+		int width, int height, int subpix_order)
+{
+  int n = src_stride;
+  int blue_offset = (subpix_order == SUBPIXEL_VBGR) ? -n : n;
+  src += n;
+
+  buffer_blit_row(dst, dst_ncmpt, src, src_ncmpt, width);
+  dst += dst_stride;
+  src += src_stride * 3;
+  for (unsigned int y = 1; y < height - 1; y++) {
+    unsigned char* d = dst;
+    unsigned char* s = src;
+    for (unsigned int x = 0; x < width; x++) {
+      s += blue_offset;
+      d[0] = filter(s[-n * 2], s[-n], s[0], s[n], s[n * 2]);
+      s += -blue_offset + 1;
+      d[1] = filter(s[-n * 2], s[-n], s[0], s[n], s[n * 2]);
+      s += -blue_offset + 1;
+      d[2] = filter(s[-n * 2], s[-n], s[0], s[n], s[n * 2]);
+      s += blue_offset - 2 + src_ncmpt;
+      d += dst_ncmpt;
+    }
+    dst += dst_stride;
+    src += src_stride * 3;
+  }
+  buffer_blit_row(dst, dst_ncmpt, src, src_ncmpt, width);
+}
+
+
 static zathura_error_t
 pdf_page_render_to_buffer(mupdf_document_t* mupdf_document, mupdf_page_t* mupdf_page,
 			  unsigned char* image, int rowstride, int components,
@@ -23,9 +136,17 @@ pdf_page_render_to_buffer(mupdf_document_t* mupdf_document, mupdf_page_t* mupdf_
   fz_display_list* display_list = fz_new_display_list(mupdf_page->ctx, NULL);
   fz_device* device             = fz_new_list_device(mupdf_page->ctx, display_list);
 
+  int subpixx = 1, subpixy = 1;
+  int subpix_order = SUBPIXEL_HRGB;
+  if (subpix_order == SUBPIXEL_HRGB || subpix_order == SUBPIXEL_HBGR) {
+    subpixx = 3;
+  } else if (subpix_order == SUBPIXEL_VRGB || subpix_order == SUBPIXEL_VBGR) {
+    subpixy = 3;
+  }
+
   fz_try (mupdf_document->ctx) {
     fz_matrix m;
-    fz_scale(&m, scalex, scaley);
+    fz_scale(&m, scalex * subpixx, scaley * subpixy);
     fz_run_page(mupdf_document->ctx, mupdf_page->page, device, &m, NULL);
   } fz_catch (mupdf_document->ctx) {
     return ZATHURA_ERROR_UNKNOWN;
@@ -33,8 +154,8 @@ pdf_page_render_to_buffer(mupdf_document_t* mupdf_document, mupdf_page_t* mupdf_
 
   fz_drop_device(mupdf_page->ctx, device);
 
-  fz_irect irect = { .x1 = page_width, .y1 = page_height };
-  fz_rect rect = { .x1 = page_width, .y1 = page_height };
+  fz_irect irect = { .x1 = page_width * subpixx, .y1 = page_height * subpixy };
+  fz_rect rect = { .x1 = page_width * subpixx, .y1 = page_height * subpixy };
 
   fz_colorspace* colorspace = fz_device_bgr(mupdf_document->ctx);
   fz_pixmap* pixmap = fz_new_pixmap_with_bbox(mupdf_page->ctx, colorspace, &irect, 1);
@@ -46,14 +167,12 @@ pdf_page_render_to_buffer(mupdf_document_t* mupdf_document, mupdf_page_t* mupdf_
 
   unsigned char* s = fz_pixmap_samples(mupdf_page->ctx, pixmap);
   unsigned int n   = fz_pixmap_components(mupdf_page->ctx, pixmap);
-  for (unsigned int y = 0; y < fz_pixmap_height(mupdf_page->ctx, pixmap); y++) {
-    for (unsigned int x = 0; x < fz_pixmap_width(mupdf_page->ctx, pixmap); x++) {
-      guchar* p = image + y * rowstride + x * components;
-      p[0] = s[2];
-      p[1] = s[1];
-      p[2] = s[0];
-      s += n;
-    }
+  if (subpixx == 3) {
+    buffer_subpix_x(image, components, rowstride, s, n, n * page_width * 3, page_width, page_height, subpix_order);
+  } else if (subpixy == 3) {
+    buffer_subpix_y(image, components, rowstride, s, n, n * page_width, page_width, page_height, subpix_order);
+  } else {
+    buffer_blit(image, components, rowstride, s, n, n * page_width, page_width, page_height);
   }
 
   fz_drop_pixmap(mupdf_page->ctx, pixmap);
